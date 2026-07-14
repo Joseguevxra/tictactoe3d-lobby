@@ -152,7 +152,8 @@ def difundir(partida, mensaje):
 
 def mensaje_estado(partida, ultima_jugada=None, reinicio=False):
     return {"tipo": STATE, "estado": partida["juego"].estado_del_juego(),
-            "ultima_jugada": ultima_jugada, "reinicio": reinicio}
+            "ultima_jugada": ultima_jugada, "reinicio": reinicio,
+            "jugadores": partida.get("jugadores", {})}
 
 
 def simbolo_por_token(partida, token):
@@ -278,7 +279,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.error_json("Endpoint no encontrado", 404)
 
     def crear(self, datos):
-        nombre = str(datos.get("nombre") or "Partida")[:60]
+        nombre_lobby = str(datos.get("lobby") or datos.get("nombre")
+                           or "Partida")[:60]
+        nombre_jugador = str(datos.get("jugador") or datos.get("nombre_jugador")
+                             or "Jugador")[:40]
         with CANDADO:
             limpiar_partidas()
             game_id = nuevo_game_id()
@@ -286,9 +290,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 game_id = nuevo_game_id()
             token = nuevo_token()
             PARTIDAS[game_id] = {
-                "nombre": nombre,
+                "nombre": nombre_lobby,
                 "juego": TicTacToe3D(),
                 "tokens": {JUGADOR_X: token, JUGADOR_O: None},
+                "jugadores": {JUGADOR_X: nombre_jugador, JUGADOR_O: None},
                 "colas": {JUGADOR_X: [], JUGADOR_O: []},
                 "iniciada": False,
                 "creada": time.time(),
@@ -300,12 +305,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def lista(self):
         with CANDADO:
             limpiar_partidas()
-            partidas = [{"game_id": gid, "nombre": p["nombre"]}
-                        for gid, p in PARTIDAS.items() if not p["iniciada"]]
+            partidas = [
+                {"game_id": gid, "nombre": p["nombre"],
+                 "jugadores": sum(1 for t in p["tokens"].values() if t),
+                 "capacidad": 2}
+                for gid, p in PARTIDAS.items() if not p["iniciada"]]
         self.responder({"partidas": partidas})
 
     def unir(self, datos):
         game_id = str(datos.get("game_id") or "")
+        nombre_jugador = str(datos.get("jugador") or datos.get("nombre")
+                             or "Jugador")[:40]
         with CANDADO:
             limpiar_partidas()
             partida = PARTIDAS.get(game_id)
@@ -317,6 +327,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             token = nuevo_token()
             partida["tokens"][JUGADOR_O] = token
+            partida.setdefault("jugadores", {})[JUGADOR_O] = nombre_jugador
             partida["iniciada"] = True
             partida["ultimo_recibir"] = time.time()
             difundir(partida, mensaje_estado(partida))
