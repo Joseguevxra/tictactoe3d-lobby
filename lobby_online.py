@@ -34,6 +34,7 @@ PONG = "pong"
 PARTIDAS = {}
 CANDADO = threading.Lock()
 LIMITE_INACTIVIDAD_S = 60
+LIMITE_PRESENCIA_S = 20
 INTERVALO_SONDEO_S = 0.4
 
 
@@ -150,9 +151,11 @@ def difundir(partida, mensaje):
     encolar(partida, JUGADOR_O, mensaje)
 
 
-def mensaje_estado(partida, ultima_jugada=None, reinicio=False):
+def mensaje_estado(partida, ultima_jugada=None, reinicio=False,
+                   rival_salio=False):
     return {"tipo": STATE, "estado": partida["juego"].estado_del_juego(),
             "ultima_jugada": ultima_jugada, "reinicio": reinicio,
+            "rival_salio": rival_salio,
             "jugadores": partida.get("jugadores", {})}
 
 
@@ -163,13 +166,41 @@ def simbolo_por_token(partida, token):
     return None
 
 
+def cantidad_jugadores(partida):
+    return sum(1 for token in partida["tokens"].values() if token)
+
+
+def liberar_jugador(partida, simbolo, ahora=None):
+    """Libera un puesto y deja la lobby disponible para otro jugador."""
+    if not partida["tokens"].get(simbolo):
+        return
+    ahora = ahora or time.time()
+    partida["tokens"][simbolo] = None
+    partida.setdefault("jugadores", {})[simbolo] = None
+    partida.setdefault("ultima_actividad", {})[simbolo] = None
+    partida["colas"][simbolo].clear()
+    partida["iniciada"] = False
+    partida["ultimo_cambio"] = ahora
+    partida["juego"].reiniciar(JUGADOR_X)
+    for otro in (JUGADOR_X, JUGADOR_O):
+        if partida["tokens"].get(otro):
+            encolar(partida, otro, mensaje_estado(
+                partida, reinicio=True, rival_salio=True))
+
+
 def limpiar_partidas():
     ahora = time.time()
     caducadas = []
-    for game_id, partida in PARTIDAS.items():
-        inactiva = ahora - partida.get("ultimo_recibir", partida["creada"]) > LIMITE_INACTIVIDAD_S
-        abandonada = not partida["iniciada"] and ahora - partida["creada"] > LIMITE_INACTIVIDAD_S
-        if inactiva or abandonada:
+    for game_id, partida in list(PARTIDAS.items()):
+        actividad = partida.setdefault("ultima_actividad", {})
+        for simbolo in (JUGADOR_X, JUGADOR_O):
+            ultima = actividad.get(simbolo)
+            if (partida["tokens"].get(simbolo) and ultima is not None
+                    and ahora - ultima > LIMITE_PRESENCIA_S):
+                liberar_jugador(partida, simbolo, ahora)
+        if (cantidad_jugadores(partida) == 0
+                and ahora - partida.get("ultimo_cambio", partida["creada"])
+                > LIMITE_INACTIVIDAD_S):
             caducadas.append(game_id)
     for game_id in caducadas:
         PARTIDAS.pop(game_id, None)
@@ -183,7 +214,9 @@ def procesar_jugada(partida, simbolo, mensaje):
                                    "mensaje": "Mensaje de jugada incompleto"})
         return
     juego = partida["juego"]
-    if juego.terminado:
+    if not partida["iniciada"]:
+        rechazo = "Espera a que se conecte el segundo jugador"
+    elif juego.terminado:
         rechazo = "La partida ya termino"
     elif simbolo != juego.turno_actual:
         rechazo = "No es su turno"
@@ -264,6 +297,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.crear(datos)
         elif self.path == "/unir":
             self.unir(datos)
+        elif self.path == "/salir":
+            self.salir(datos)
         elif self.path == "/enviar":
             self.enviar(datos)
         else:
@@ -279,60 +314,88 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.error_json("Endpoint no encontrado", 404)
 
     def crear(self, datos):
-        nombre_lobby = str(datos.get("lobby") or datos.get("nombre")
-                           or "Partida")[:60]
-        nombre_jugador = str(datos.get("jugador") or datos.get("nombre_jugador")
-                             or "Jugador")[:40]
+        nombre_lobby = (str(datos.get("lobby") or datos.get("nombre")
+                            or "Partida").strip()[:60] or "Partida")
+        nombre_jugador = (str(datos.get("jugador")
+                              or datos.get("nombre_jugador")
+                              or "Jugador").strip()[:40] or "Jugador")
         with CANDADO:
             limpiar_partidas()
+            nombre_normalizado = nombre_lobby.casefold()
+            if any(p["nombre"].strip().casefold() == nombre_normalizado
+                   for p in PARTIDAS.values()):
+                self.error_json(
+                    "Ya existe una partida con ese nombre. Elige otro nombre.")
+                return
             game_id = nuevo_game_id()
             while game_id in PARTIDAS:
                 game_id = nuevo_game_id()
             token = nuevo_token()
+            ahora = time.time()
             PARTIDAS[game_id] = {
                 "nombre": nombre_lobby,
                 "juego": TicTacToe3D(),
                 "tokens": {JUGADOR_X: token, JUGADOR_O: None},
                 "jugadores": {JUGADOR_X: nombre_jugador, JUGADOR_O: None},
                 "colas": {JUGADOR_X: [], JUGADOR_O: []},
+                "ultima_actividad": {JUGADOR_X: ahora, JUGADOR_O: None},
                 "iniciada": False,
-                "creada": time.time(),
-                "ultimo_recibir": time.time(),
+                "creada": ahora,
+                "ultimo_cambio": ahora,
             }
+            estado = mensaje_estado(PARTIDAS[game_id])
         self.responder({"game_id": game_id, "simbolo": JUGADOR_X,
-                        "token": token})
+                        "token": token, "estado": estado})
 
     def lista(self):
         with CANDADO:
             limpiar_partidas()
             partidas = [
                 {"game_id": gid, "nombre": p["nombre"],
-                 "jugadores": sum(1 for t in p["tokens"].values() if t),
-                 "capacidad": 2}
-                for gid, p in PARTIDAS.items() if not p["iniciada"]]
+                 "jugadores": cantidad_jugadores(p), "capacidad": 2}
+                for gid, p in PARTIDAS.items()]
         self.responder({"partidas": partidas})
 
     def unir(self, datos):
         game_id = str(datos.get("game_id") or "")
-        nombre_jugador = str(datos.get("jugador") or datos.get("nombre")
-                             or "Jugador")[:40]
+        nombre_jugador = (str(datos.get("jugador") or datos.get("nombre")
+                              or "Jugador").strip()[:40] or "Jugador")
         with CANDADO:
             limpiar_partidas()
             partida = PARTIDAS.get(game_id)
             if partida is None:
                 self.error_json("La partida no existe")
                 return
-            if partida["iniciada"]:
+            libres = [simbolo for simbolo in (JUGADOR_X, JUGADOR_O)
+                      if not partida["tokens"].get(simbolo)]
+            if not libres:
                 self.error_json("La partida ya esta llena")
                 return
+            simbolo = libres[0]
             token = nuevo_token()
-            partida["tokens"][JUGADOR_O] = token
-            partida.setdefault("jugadores", {})[JUGADOR_O] = nombre_jugador
-            partida["iniciada"] = True
-            partida["ultimo_recibir"] = time.time()
+            ahora = time.time()
+            partida["tokens"][simbolo] = token
+            partida.setdefault("jugadores", {})[simbolo] = nombre_jugador
+            partida.setdefault("ultima_actividad", {})[simbolo] = ahora
+            partida["iniciada"] = cantidad_jugadores(partida) == 2
+            partida["ultimo_cambio"] = ahora
+            estado = mensaje_estado(partida)
             difundir(partida, mensaje_estado(partida))
-        self.responder({"game_id": game_id, "simbolo": JUGADOR_O,
-                        "token": token})
+        self.responder({"game_id": game_id, "simbolo": simbolo,
+                        "token": token, "estado": estado})
+
+    def salir(self, datos):
+        game_id = str(datos.get("game_id") or "")
+        token = str(datos.get("token") or "")
+        with CANDADO:
+            partida = PARTIDAS.get(game_id)
+            if partida is None:
+                self.responder({"ok": True})
+                return
+            simbolo = simbolo_por_token(partida, token)
+            if simbolo is not None:
+                liberar_jugador(partida, simbolo)
+        self.responder({"ok": True})
 
     def enviar(self, datos):
         game_id = str(datos.get("game_id") or "")
@@ -350,6 +413,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if simbolo is None:
                 self.error_json("Token invalido")
                 return
+            partida.setdefault("ultima_actividad", {})[simbolo] = time.time()
             procesar_mensaje(partida, simbolo, mensaje)
         self.responder({"ok": True})
 
@@ -368,7 +432,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if simbolo is None:
                     self.error_json("Token invalido")
                     return
-                partida["ultimo_recibir"] = time.time()
+                partida.setdefault("ultima_actividad", {})[simbolo] = time.time()
                 mensajes = partida["colas"][simbolo][:]
                 if mensajes:
                     partida["colas"][simbolo].clear()
